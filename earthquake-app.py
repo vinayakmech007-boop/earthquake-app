@@ -1,11 +1,12 @@
 import os
-from datetime import date, datetime, time
+import time
+from datetime import date, datetime, time as dtime
 
+import requests
 import pandas as pd
 import streamlit as st
 import altair as alt
 from concurrent.futures import ThreadPoolExecutor
-from nsepython import nse_quote_ltp
 
 # ---------------------------------
 # ✅ Streamlit page config
@@ -51,7 +52,7 @@ def should_store_if_missed():
         return False
 
     # If time is AFTER 3:30 PM → store once
-    if now.time() >= time(15, 30):
+    if now.time() >= dtime(15, 30):
         os.makedirs("data", exist_ok=True)
         with open(FLAG_FILE, "w") as f:
             f.write(today_str)
@@ -61,44 +62,80 @@ def should_store_if_missed():
 
 
 # ---------------------------------
-# ✅ Single symbol fetch
+# ✅ Stable NSE fetcher (replaces nse_quote_ltp)
 # ---------------------------------
 def fetch_single(symbol: str) -> dict:
+    """
+    Fetch live data for a single NSE symbol using official JSON API.
+    Includes session, headers, cookies and retry logic.
+    """
+    base_url = "https://www.nseindia.com"
+    quote_url = f"{base_url}/api/quote-equity?symbol={symbol}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": f"{base_url}/get-quotes/equity?symbol={symbol}",
+    }
+
+    session = requests.Session()
+
+    # ✅ Step 1: Get cookies from homepage (required by NSE)
     try:
-        data = nse_quote_ltp(symbol)
-        price_info = data.get("priceInfo", {})
+        session.get(base_url, headers=headers, timeout=5)
+    except Exception:
+        # Even if this fails, we still attempt the quote API
+        pass
 
-        current_price = price_info.get("lastPrice", None)
-        previous_close = price_info.get("previousClose", None)
-        volume = price_info.get("totalTradedVolume", None)
+    # ✅ Step 2: Try multiple times to fetch data
+    last_error = None
+    for _ in range(3):
+        try:
+            r = session.get(quote_url, headers=headers, timeout=7)
+            r.raise_for_status()
+            data = r.json()
 
-        percent_change = None
-        if current_price is not None and previous_close not in (None, 0):
-            percent_change = ((current_price - previous_close) / previous_close) * 100
+            price_info = data.get("priceInfo", {}) or {}
 
-        value_cr = None
-        if current_price is not None and volume is not None:
-            value_cr = (current_price * volume) / 10000000  # 1 Cr = 10,000,000
+            current_price = price_info.get("lastPrice", None)
+            previous_close = price_info.get("previousClose", None)
+            volume = price_info.get("totalTradedVolume", None)
 
-        return {
-            "Symbol": symbol,
-            "Current Price": current_price,
-            "Previous Close": previous_close,
-            "Percent Change (%)": round(percent_change, 2) if percent_change else None,
-            "Volume": volume,
-            "Value (Cr)": round(value_cr, 2) if value_cr else None,
-        }
+            percent_change = None
+            if current_price is not None and previous_close not in (None, 0):
+                percent_change = ((current_price - previous_close) / previous_close) * 100
 
-    except Exception as e:
-        return {
-            "Symbol": symbol,
-            "Current Price": None,
-            "Previous Close": None,
-            "Percent Change (%)": None,
-            "Volume": None,
-            "Value (Cr)": None,
-            "Error": str(e),
-        }
+            value_cr = None
+            if current_price is not None and volume is not None:
+                # 1 Cr = 10,000,000
+                value_cr = (current_price * volume) / 10000000
+
+            return {
+                "Symbol": symbol,
+                "Current Price": current_price,
+                "Previous Close": previous_close,
+                "Percent Change (%)": round(percent_change, 2) if percent_change is not None else None,
+                "Volume": volume,
+                "Value (Cr)": round(value_cr, 2) if value_cr is not None else None,
+            }
+
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(0.7)
+
+    # ✅ If all retries fail
+    return {
+        "Symbol": symbol,
+        "Current Price": None,
+        "Previous Close": None,
+        "Percent Change (%)": None,
+        "Volume": None,
+        "Value (Cr)": None,
+        "Error": last_error or "Failed to fetch",
+    }
 
 
 # ---------------------------------
@@ -106,9 +143,15 @@ def fetch_single(symbol: str) -> dict:
 # ---------------------------------
 @st.cache_data(show_spinner=True, ttl=10)
 def fetch_data(symbols):
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         results = list(executor.map(fetch_single, symbols))
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+
+    # If everything failed, don't cache the bad result
+    if df["Current Price"].isna().all():
+        # Clear and raise so Streamlit shows something is wrong
+        fetch_data.clear()
+    return df
 
 
 # ---------------------------------
@@ -167,9 +210,6 @@ if refresh_clicked:
     fetch_data.clear()
 
 
-# ✅ (Delete history manual block removed here)
-
-
 # ---------------------------------
 # ✅ Fetch live data
 # ---------------------------------
@@ -186,7 +226,6 @@ if is_today_saved():
     st.success("✅ Today's 3:30 PM snapshot is saved")
 else:
     st.warning("⚠️ Today's 3:30 PM snapshot is NOT saved yet")
-
 
 st.caption(f"Last updated: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}")
 
